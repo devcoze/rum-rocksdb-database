@@ -6,9 +6,9 @@ import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 
 import java.io.IOException;
-import java.nio.channels.FileLock;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.Map;
 
 /**
@@ -19,16 +19,31 @@ import java.util.Map;
 public class RocksdbWrapper<K, V> {
 
     private RocksDB db;
+    /**
+     * dataDir，数据存储目录
+     */
     private final String dataDir;
+    /**
+     * 数据库名称
+     */
     private final String dbName;
-    private final FixedVersionRecordLock lock;
+    /**
+     * 数据库的存储路径
+     */
     private final Path dbPath;
+    /**
+     * 版本记录工具
+     */
+    private final FixedVersionRecordLock fixedVersionRecordLock;
+
+    private final Serde<K> keySerializer;
+    private final Serde<V> valueSerializer;
 
     static {
         RocksDB.loadLibrary();
     }
 
-    public RocksdbWrapper(String dataDir, String dbName) throws IOException {
+    public RocksdbWrapper(String dataDir, String dbName, Serde<K> kSerde, Serde<V> vSerde) throws IOException {
         Preconditions.checkNotNull(dataDir, "dataDir can not be null");
         this.dataDir = dataDir;
         Preconditions.checkNotNull(dbName, "dbName can not be null");
@@ -42,11 +57,17 @@ public class RocksdbWrapper<K, V> {
             Files.createDirectories(dbPath);
         }
         this.dbPath = dbPath;
-        lock = new FixedVersionRecordLock(dbPath);
+        fixedVersionRecordLock = new FixedVersionRecordLock(dbPath);
+        this.keySerializer = kSerde;
+        this.valueSerializer = vSerde;
     }
 
     public String name() {
         return dbName;
+    }
+
+    public int version() {
+        return fixedVersionRecordLock.maxVersion();
     }
 
     /**
@@ -54,7 +75,7 @@ public class RocksdbWrapper<K, V> {
      * @return 是否成功打开
      */
     public boolean open() {
-        short i = lock.maxVersion();
+        int i = fixedVersionRecordLock.maxVersion();
         if (i == 0) {
             return false;
         }
@@ -64,41 +85,51 @@ public class RocksdbWrapper<K, V> {
         }
         try {
             db = RocksDB.open(verDBPath.toString());
-            lock.put(i, System.currentTimeMillis());
+            fixedVersionRecordLock.put(i, System.currentTimeMillis());
             return true;
         } catch (Exception e) {
             return false;
         }
     }
 
-    public void write(Map<K, V> data) throws IOException, RocksDBException {
-        FileLock fileLock = lock.tryLockMeta();
-        if (fileLock == null) {
-            throw new IOException("Failed to acquire meta lock");
-        }
-        short next = (short) (lock.maxVersion() + 1);
-        Path verDBPath = dbPath.resolve(next+"");
-        if (!Files.exists(verDBPath)) {
-            Files.createDirectories(verDBPath);
-        }
-        RocksDB open = RocksDB.open(verDBPath.toString());
-        for (Map.Entry<K, V> entry : data.entrySet()) {
-            open.put(entry.getKey().toString().getBytes(), entry.getValue().toString().getBytes());
-        }
-        open.close();
+    private static final String _temp_version_prefix = "_temp_v%d_%d";
 
-        lock.put(next, System.currentTimeMillis());
-        lock.updateMeta(next);
-        lock.releaseLock(fileLock);
+    public void write(Map<K, V> data) throws IOException, RocksDBException {
+
+        // 数据库的版本号
+        int expectedVer = fixedVersionRecordLock.maxVersion();
+        int next = expectedVer + 1;
+
+        // 把数据写入临时版本中
+        String tempVersionPath = String.format(_temp_version_prefix, next, Instant.now().toEpochMilli());
+        Path tempVerPath = dbPath.resolve(tempVersionPath);
+        if (!Files.exists(tempVerPath)) {
+            Files.createDirectories(tempVerPath);
+        }
+        RocksDB newRocksDB = RocksDB.open(tempVerPath.toString());
+        for (Map.Entry<K, V> entry : data.entrySet()) {
+            byte[] kBytes = keySerializer.serializer(entry.getKey());
+            byte[] vBytes = valueSerializer.serializer(entry.getValue());
+            newRocksDB.put(kBytes, vBytes);
+        }
+
+        // 写入完成后直接关闭
+        newRocksDB.close();
+
+        Path nextVersionPath = dbPath.resolve(String.valueOf(next));
+        // 安全更新版本原数据，如果更新成功，重新命名，如果失败直接删除
+        if (fixedVersionRecordLock.compareAndSetVersion(expectedVer, next)) {
+            Files.move(tempVerPath, dbPath.resolve(nextVersionPath));
+        } else {
+            Files.deleteIfExists(tempVerPath);
+        }
+
     }
 
     public V search(K key) throws RocksDBException {
-        byte[] bytes = db.get(key.toString().getBytes());
-        if (bytes == null) {
-            return null;
-        }
-        String s = new String(bytes);
-        return (V) s;
+        byte[] kBytes = keySerializer.serializer(key);
+        byte[] v = db.get(kBytes);
+        return valueSerializer.deserializer(v);
     }
 
     public void finishWrite() {

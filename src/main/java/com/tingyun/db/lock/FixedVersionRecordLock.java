@@ -8,6 +8,7 @@ import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Path;
 
 import static java.nio.file.StandardOpenOption.*;
@@ -15,10 +16,10 @@ import static java.nio.file.StandardOpenOption.*;
 /**
  * 固定版本号记录锁
  * Record Structure:
- *  Meta Data (2 bytes)
- *  - Current Version (short) : 2 bytes - 当前版本号
+ *  Metadata (4 bytes)
+ *  - Current Version (int) : 4 bytes - 当前版本号
  *  Records (10 bytes each)
- *  - Version (short) : 2 bytes - 版本号
+ *  - Version (int) : 4 bytes - 版本号
  *  - Value (long) : 8 bytes - 关联值
  */
 @Slf4j
@@ -26,14 +27,14 @@ public final class FixedVersionRecordLock {
 
     private static final String VERSION = "_VERSION";
 
-    // 元数据大小 (字节), short(2)
-    private static final int META_SIZE = 2;
-    // 每条记录的大小 (字节), short(2) + long(8) = 10字节
-    private static final int RECORD_SIZE = 10;
+    // 元数据大小 (字节), int(4)
+    private static final int META_SIZE = 4;
+    // 每条记录的大小 (字节), int(4) + long(8) = 10字节
+    private static final int RECORD_SIZE = 12;
     // 默认记录数
     private static final int DEFAULT_RECORDS = 64;
-    // 最大记录数, 受限于short类型
-    private static final int MAX_RECORDS = Short.MAX_VALUE;
+    // 最大记录数, 受限于int类型
+    private static final int MAX_RECORDS = 1000;
 
     /**
      * 能够存储的版本号数量
@@ -88,9 +89,49 @@ public final class FixedVersionRecordLock {
      * 获取最大版本号, 即最后存储的版本号
      * @return 最大版本号
      */
-    public short maxVersion() {
+    public int maxVersion() {
         buffer.position(0);
-        return buffer.getShort();
+        return buffer.getInt();
+    }
+
+    /**
+     * CAS 更新版本号：只有当前版本等于 expectedVersion 时才更新
+     *
+     * @param expectedVersion 期望的当前版本号
+     * @param newVersion      新版本号
+     * @return true=更新成功，false=版本不匹配或被其他进程占用
+     */
+    public boolean compareAndSetVersion(int expectedVersion, int newVersion) {
+        if (newVersion <= 0 || newVersion >= recordCount) {
+            throw new IllegalArgumentException("Version out of range: " + newVersion);
+        }
+
+        FileLock lock = null;
+        try {
+            lock = channel.tryLock(0, META_SIZE, false);
+            if (lock == null) {
+                return false; // 被其他进程锁住
+            }
+
+            buffer.position(0);
+            int current = buffer.getInt(0);
+            if (current != expectedVersion) {
+                return false; // 版本不一致，不更新
+            }
+
+            buffer.putInt(0, newVersion);
+            buffer.force();
+            return true;
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to update version", e);
+        } finally {
+            if (lock != null) {
+                try {
+                    lock.release();
+                } catch (IOException ignore) {
+                }
+            }
+        }
     }
 
     /**
@@ -99,16 +140,11 @@ public final class FixedVersionRecordLock {
      * @throws IOException 如果IO异常
      */
     public FileLock tryLockMeta() throws IOException {
-        return channel.tryLock(0, META_SIZE, false);
-    }
-
-    public void updateMeta(short version) {
-        if (version <= 0 || version >= recordCount) {
-            throw new IllegalArgumentException("Version out of range: " + version);
+        try {
+            return channel.tryLock(0, META_SIZE, false);
+        } catch (OverlappingFileLockException e) {
+            return null;
         }
-        buffer.position(0);
-        buffer.putShort(version);
-        buffer.force();
     }
 
     /**
@@ -117,7 +153,7 @@ public final class FixedVersionRecordLock {
      * @return true表示锁定成功, false表示锁定失败
      * @throws IOException 如果IO异常
      */
-    public FileLock tryLockRecord(short version) throws IOException {
+    public FileLock tryLockRecord(int version) throws IOException {
         if (version <= 0 || version >= recordCount) {
             throw new IllegalArgumentException("Version out of range: " + version);
         }
@@ -142,8 +178,8 @@ public final class FixedVersionRecordLock {
      * @param version 版本号
      * @param value 值
      */
-    public void put(short version, long value) throws IOException {
-        Preconditions.checkArgument(version <= 0 || version >= recordCount, "Version out of range: " + version);
+    public void put(int version, long value) throws IOException {
+        Preconditions.checkArgument(version > 0 && version < recordCount, "version out of range: " + version);
         FileLock fileLock = tryLockRecord(version);
         if (fileLock == null) {
             throw new IOException("Failed to acquire lock for version: " + version);
@@ -151,7 +187,7 @@ public final class FixedVersionRecordLock {
         try {
             int position = META_SIZE + (version - 1) * RECORD_SIZE;
             buffer.position(position);
-            buffer.putShort(version);
+            buffer.putInt(version);
             buffer.putLong(value);
             buffer.force();
         } finally {
@@ -164,12 +200,12 @@ public final class FixedVersionRecordLock {
      * @param version 版本号
      * @return 值, 如果版本号不存在则返回null
      */
-    public Long value(short version) {
+    public Long value(int version) {
         Preconditions.checkArgument(version <= 0 || version >= recordCount, "Version out of range: " + version);
         int position = META_SIZE + (version - 1) * RECORD_SIZE;
         try (FileLock fileLock = channel.lock(position, RECORD_SIZE, true)) {
             buffer.position(position);
-            short ver = buffer.getShort();
+            int ver = buffer.getInt();
             if (ver != version) {
                 return null;
             }
