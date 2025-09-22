@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * RocksDB包装类
@@ -18,7 +19,11 @@ import java.util.Map;
  */
 public class RocksdbWrapper<K, V> {
 
-    private RocksDB db;
+
+    private static final int READY = 1;
+
+    private static final int NOT_READY = 0;
+
     /**
      * dataDir，数据存储目录
      */
@@ -38,6 +43,13 @@ public class RocksdbWrapper<K, V> {
 
     private final Serde<K> keySerializer;
     private final Serde<V> valueSerializer;
+
+    /**
+     * 数据库的状态，0 不可
+     */
+    private final AtomicInteger _dbState = new AtomicInteger(NOT_READY);
+    private RocksDB db;
+    private int dbVersion;
 
     static {
         RocksDB.loadLibrary();
@@ -75,17 +87,27 @@ public class RocksdbWrapper<K, V> {
      * @return 是否成功打开
      */
     public boolean open() {
-        int i = fixedVersionRecordLock.maxVersion();
-        if (i == 0) {
+        int maxed = fixedVersionRecordLock.maxVersion();
+        // maxed: 0 标识该数据当前为空
+        if (maxed == 0) {
             return false;
         }
-        Path verDBPath = dbPath.resolve(i+"");
+
+        // 当前数据库已打开version 和 maxed 相同
+        if (dbVersion == maxed) {
+            return true;
+        }
+
+        // maxed 对应的版本不存在，无法打开
+        Path verDBPath = dbPath.resolve(String.valueOf(maxed));
         if (!Files.exists(verDBPath)) {
             return false;
         }
         try {
             db = RocksDB.open(verDBPath.toString());
-            fixedVersionRecordLock.put(i, System.currentTimeMillis());
+            // 更新版本最后打开时间
+            fixedVersionRecordLock.put(maxed, System.currentTimeMillis());
+            dbVersion = maxed;
             return true;
         } catch (Exception e) {
             return false;
@@ -94,14 +116,20 @@ public class RocksdbWrapper<K, V> {
 
     private static final String _temp_version_prefix = "_temp_v%d_%d";
 
+    /**
+     * 数据写入
+     * @param data
+     * @throws IOException
+     * @throws RocksDBException
+     */
     public void write(Map<K, V> data) throws IOException, RocksDBException {
 
-        // 数据库的版本号
-        int expectedVer = fixedVersionRecordLock.maxVersion();
-        int next = expectedVer + 1;
+        // 1 数据库的版本号
+        int curV = fixedVersionRecordLock.maxVersion();
+        int nextV = curV + 1;
 
-        // 把数据写入临时版本中
-        String tempVersionPath = String.format(_temp_version_prefix, next, Instant.now().toEpochMilli());
+        // 2 为了防止竞争，把数据写入临时版本中，临时版本是随机生成的
+        String tempVersionPath = String.format(_temp_version_prefix, nextV, Instant.now().toEpochMilli());
         Path tempVerPath = dbPath.resolve(tempVersionPath);
         if (!Files.exists(tempVerPath)) {
             Files.createDirectories(tempVerPath);
@@ -113,12 +141,12 @@ public class RocksdbWrapper<K, V> {
             newRocksDB.put(kBytes, vBytes);
         }
 
-        // 写入完成后直接关闭
+        // 3 写入完成后必须先关闭
         newRocksDB.close();
 
-        Path nextVersionPath = dbPath.resolve(String.valueOf(next));
-        // 安全更新版本原数据，如果更新成功，重新命名，如果失败直接删除
-        if (fixedVersionRecordLock.compareAndSetVersion(expectedVer, next)) {
+        Path nextVersionPath = dbPath.resolve(String.valueOf(nextV));
+        // 4 安全更新数据库版本的原数据，如果更新成功，重新命名，如果失败直接删除
+        if (fixedVersionRecordLock.compareAndSetVersion(curV, nextV)) {
             Files.move(tempVerPath, dbPath.resolve(nextVersionPath));
         } else {
             Files.deleteIfExists(tempVerPath);
@@ -127,6 +155,9 @@ public class RocksdbWrapper<K, V> {
     }
 
     public V search(K key) throws RocksDBException {
+        if (_dbState.get() != 1) {
+            throw new RocksDBException("RocksDB open failed");
+        }
         byte[] kBytes = keySerializer.serializer(key);
         byte[] v = db.get(kBytes);
         return valueSerializer.deserializer(v);

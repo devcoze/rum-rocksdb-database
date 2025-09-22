@@ -98,39 +98,27 @@ public final class FixedVersionRecordLock {
      * CAS 更新版本号：只有当前版本等于 expectedVersion 时才更新
      *
      * @param expectedVersion 期望的当前版本号
-     * @param newVersion      新版本号
+     * @param newVersion      新版本号, 版本只能向上增加
      * @return true=更新成功，false=版本不匹配或被其他进程占用
      */
     public boolean compareAndSetVersion(int expectedVersion, int newVersion) {
-        if (newVersion <= 0 || newVersion >= recordCount) {
-            throw new IllegalArgumentException("Version out of range: " + newVersion);
-        }
 
-        FileLock lock = null;
-        try {
-            lock = channel.tryLock(0, META_SIZE, false);
+        Preconditions.checkArgument(newVersion > expectedVersion && newVersion <= recordCount, "newVersion should be greater than or equal to recordCount");
+
+        try (FileLock lock = tryLockMeta()) {
             if (lock == null) {
                 return false; // 被其他进程锁住
             }
-
             buffer.position(0);
             int current = buffer.getInt(0);
             if (current != expectedVersion) {
                 return false; // 版本不一致，不更新
             }
-
             buffer.putInt(0, newVersion);
             buffer.force();
             return true;
         } catch (IOException e) {
             throw new RuntimeException("Failed to update version", e);
-        } finally {
-            if (lock != null) {
-                try {
-                    lock.release();
-                } catch (IOException ignore) {
-                }
-            }
         }
     }
 
