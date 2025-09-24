@@ -21,7 +21,7 @@ public class MultiDBManagerTest {
         config.setDataDir("/Users/chenlt/tingyun/rocksdb_test");
         config.setMaxOpenDB(10);
         config.setMaxIdleTime(30);
-        config.setMaxDBSize(50);
+        config.setMaxDiskUsageGB(50);
         MultiDBManager<Long, String> multiDBManager = new MultiDBManager<>(config, LongRocksdbSerde.INSTANCE, StringRocksdbSerde.INSTANCE);
 
         MapWriteOnce<Long, String> longStringMapWriteProxy = new MapWriteOnce<>(Map.of(1234L, "hello", 1235L, "world", 1236L, "!!!"));
@@ -37,7 +37,7 @@ public class MultiDBManagerTest {
         config.setDataDir("/Users/chenlt/tingyun/rocksdb_test");
         config.setMaxOpenDB(10);
         config.setMaxIdleTime(30);
-        config.setMaxDBSize(50);
+        config.setMaxDiskUsageGB(50);
         MultiDBManager<Long, String> multiDBManager = new MultiDBManager<>(config, LongRocksdbSerde.INSTANCE, StringRocksdbSerde.INSTANCE);
         RocksdbWrapper<Long, String> testdb = multiDBManager.getDB("testdbccc");
         if (testdb != null) {

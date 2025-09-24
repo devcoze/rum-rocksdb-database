@@ -20,6 +20,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
+import static com.tingyun.db.MultiDBManagerConfig.DEFAULT_VERSION_DB_COUNT;
+import static com.tingyun.db.MultiDBManagerConfig.DEFAULT_VERSION_EXPIRE_TIME;
+
 /**
  * 只读的RocksDB包装类，支持多版本管理
  * @param <K> key类型
@@ -29,13 +32,7 @@ import java.util.Optional;
 public class ReadonlyRocksDBWrapper<K, V> {
 
     // 清理状态，-1表示正在被清理
-    protected static final long CLEAR_STATE = -1L;
-    // 默认的版本DB数量，超过该数量未被访问的版本DB将被关闭
-    protected static final int DEFAULT_VERSION_DB_COUNT = 10;
-    // 默认的版本过期时间，超过该时间未被访问则关闭，单位分钟
-    protected static final int DEFAULT_VERSION_EXPIRE_TIME = 30; // 分钟
-    // 默认的清理过期版本的时间，单位分钟，默认24小时
-    protected static final int DEFAULT_VERSION_CLEAR_TIME = 24 * 60;
+    public static final long CLEAR_STATE = -1L;
 
     /**
      * 数据库名称

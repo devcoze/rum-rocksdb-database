@@ -22,7 +22,7 @@ import static java.nio.file.StandardOpenOption.*;
  *  - Value (long) : 8 bytes - 关联值
  */
 @Slf4j
-public final class FixedVersionRecordLock {
+public final class FixedVersionRecordLock implements AutoCloseable {
 
     // 版本文件管理文件名
     private static final String VERSION = "_VERSION";
@@ -241,6 +241,7 @@ public final class FixedVersionRecordLock {
      * 关闭资源
      * @throws IOException 如果IO异常
      */
+    @Override
     public void close() throws IOException {
         if (channel != null && channel.isOpen()) {
             channel.close();

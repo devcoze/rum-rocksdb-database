@@ -1,26 +1,37 @@
 package com.tingyun.db;
 
+import com.google.common.base.Preconditions;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import com.google.common.cache.RemovalListener;
 import com.google.common.cache.RemovalNotification;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import com.tingyun.db.lock.FixedVersionRecordLock;
 import com.tingyun.db.rocksdb.RocksdbWrapper;
 import com.tingyun.db.rocksdb.serde.RocksdbSerde;
 import com.tingyun.db.rocksdb.writer.RocksdbOnceWriter;
+import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.rocksdb.RocksDBException;
 
 import java.io.IOException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Optional;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
+
+import static com.tingyun.db.rocksdb.ReadonlyRocksDBWrapper.CLEAR_STATE;
 
 /**
  * 多数据库管理器
@@ -29,44 +40,27 @@ import java.util.concurrent.TimeUnit;
  * @param <V> value类型
  */
 @Slf4j
-public class MultiDBManager<K, V> {
-    /**
-     * 同时打开的数据库个数
-     */
-    private int maxOpenDb;
-    /**
-     * 数据库最大空闲时间, 超过该时间未被访问则关闭, 单位: 分钟
-     */
-    private int maxIdleTime;
-    /**
-     * 数据存储目录
-     */
-    private final String dataDir;
+public class MultiDBManager<K, V> implements AutoCloseable {
     /**
      * 数据存储目录路径
      */
     private final Path dataPath;
     /**
-     * 该数据存储目录下所有数据库总和, 单位: GB
+     * 最大磁盘使用量，单位字节
      */
-    private int maxDataSize; // GB
+    private final long maxDiskUsageBytes;
 
     private final RocksdbSerde<K> kRocksdbSerde;
     private final RocksdbSerde<V> vRocksdbSerde;
     private final LoadingCache<String, Optional<RocksdbWrapper<K, V>>> rocksdbWrapperLoadingCache;
     private final ScheduledExecutorService scheduledExecutorService;
-    private MultiDBManagerConfig dbManagerConfig;
+    private final MultiDBManagerConfig dbManagerConfig;
 
-
-    public MultiDBManager(MultiDBManagerConfig config, RocksdbSerde<K> kRocksdbSerde, RocksdbSerde<V> vRocksdbSerde) throws IOException {
-        this(config.getDataDir(), config.getMaxOpenDB(), config.getMaxIdleTime(), config.getMaxDBSize(),
-                config.getCleanTaskDelay(), config.getCleanTaskPeriod(), kRocksdbSerde, vRocksdbSerde);
-    }
-
-    public MultiDBManager(String dataDir, int maxOpenDb, int maxIdleTime, int maxDataSize,
-                          int cleanTaskDelayMinutes, int cleanTaskPeriodMinutes,
+    public MultiDBManager(MultiDBManagerConfig config,
                           RocksdbSerde<K> kRocksdbSerde, RocksdbSerde<V> vRocksdbSerde) throws IOException {
-        this.dataDir = dataDir;
+        Preconditions.checkNotNull(config, "MultiDBManagerConfig cannot be null");
+        this.dbManagerConfig = config;
+        String dataDir = config.getDataDir();
         Path path = Path.of(dataDir);
         if (!Files.exists(path)) {
             Files.createDirectories(path);
@@ -75,24 +69,24 @@ public class MultiDBManager<K, V> {
         if (!Files.isDirectory(path)) {
             throw new IOException("Data directory is not a directory: " + dataDir);
         }
-        this.maxOpenDb = maxOpenDb;
-        this.maxIdleTime = maxIdleTime;
+        int maxOpenDb = config.getMaxOpenDB();
+        int maxIdleTime = config.getMaxIdleTime();
         this.dataPath = path;
         this.kRocksdbSerde = kRocksdbSerde;
         this.vRocksdbSerde = vRocksdbSerde;
-        this.maxDataSize = maxDataSize;
+        this.maxDiskUsageBytes = config.getMaxDiskUsageGB() * FileUtils.ONE_GB;
         this.rocksdbWrapperLoadingCache = CacheBuilder.newBuilder()
-                .expireAfterAccess(this.maxIdleTime, TimeUnit.MINUTES)
-                .maximumSize(this.maxOpenDb)
+                .expireAfterAccess(maxIdleTime, TimeUnit.MINUTES)
+                .maximumSize(maxOpenDb)
                 .removalListener(new RocksdbWrapperRemoveListener<K, V>())
-                .build(new RocksdbWrapperLoader<>(dataDir, kRocksdbSerde, vRocksdbSerde, null));
+                .build(new RocksdbWrapperLoader<>(dbManagerConfig, kRocksdbSerde, vRocksdbSerde));
         ThreadFactory threadFactory = new ThreadFactoryBuilder()
                 .setNameFormat("MultiDBManager-Cleanup-Thread-%d")
                 .setDaemon(true)
                 .build();
         this.scheduledExecutorService = new ScheduledThreadPoolExecutor(5, threadFactory);
         // 启动定时清理任务
-        startCleanupTask(cleanTaskDelayMinutes, cleanTaskPeriodMinutes);
+        startCleanupTask(config.getCleanTaskDelay(), config.getCleanTaskPeriod());
     }
 
     public RocksdbWrapper<K, V> getDB(String dbName) {
@@ -109,26 +103,23 @@ public class MultiDBManager<K, V> {
      * @param <V> value类型
      */
     static class RocksdbWrapperLoader<K, V> extends CacheLoader<String, Optional<RocksdbWrapper<K, V>>> {
-        private final String dataDir;
         private final RocksdbSerde<K> kRocksdbSerde;
         private final RocksdbSerde<V> vRocksdbSerde;
-        private final MultiDBManagerConfig.DatabaseConfig databaseConfig;
+        private final MultiDBManagerConfig dbManagerConfig;
 
-        public RocksdbWrapperLoader(String dataDir, RocksdbSerde<K> kRocksdbSerde, RocksdbSerde<V> vRocksdbSerde,
-                                    MultiDBManagerConfig.DatabaseConfig databaseConfig) {
-            this.dataDir = dataDir;
+        public RocksdbWrapperLoader(MultiDBManagerConfig dbManagerConfig, RocksdbSerde<K> kRocksdbSerde, RocksdbSerde<V> vRocksdbSerde) {
             this.kRocksdbSerde = kRocksdbSerde;
             this.vRocksdbSerde = vRocksdbSerde;
-            this.databaseConfig = databaseConfig;
+            this.dbManagerConfig = dbManagerConfig;
         }
 
         @Override
-        public Optional<RocksdbWrapper<K, V>> load(String dbName) {
+        public @NonNull Optional<RocksdbWrapper<K, V>> load(@NonNull String dbName) {
             try {
-                RocksdbWrapper<K, V> rocksdbWrapper = new RocksdbWrapper<>(dataDir, dbName, kRocksdbSerde, vRocksdbSerde);
+                RocksdbWrapper<K, V> rocksdbWrapper = new RocksdbWrapper<>(dbManagerConfig, dbName, kRocksdbSerde, vRocksdbSerde);
                 return Optional.of(rocksdbWrapper);
             } catch (Exception e) {
-                log.error("Failed to load RocksDB: {} in dir: {}", dbName, dataDir, e);
+                log.error("Failed to load RocksDB: {} in dir: {}", dbName, dbManagerConfig.getDataDir(), e);
                 return Optional.empty();
             }
         }
@@ -170,13 +161,71 @@ public class MultiDBManager<K, V> {
         }
         Optional<RocksdbWrapper<K, V>> rocksdbWrapper = rocksdbWrapperLoadingCache.getUnchecked(dbName);
         if (rocksdbWrapper.isEmpty()) {
-            RocksdbWrapper<K, V> newRocksdbWrapper = new RocksdbWrapper<>(dataDir, dbName, kRocksdbSerde, vRocksdbSerde);
+            RocksdbWrapper<K, V> newRocksdbWrapper = new RocksdbWrapper<>(dbManagerConfig, dbName, kRocksdbSerde, vRocksdbSerde);
             newRocksdbWrapper.writeOnceWithWriter(proxy);
             rocksdbWrapperLoadingCache.put(dbName, Optional.of(newRocksdbWrapper));
         } else {
             rocksdbWrapper.get().writeOnceWithWriter(proxy);
         }
+
+        // 写入数据后，检查磁盘使用量
+        enforceDiskQuota();
     }
+
+    public void enforceDiskQuota() throws IOException {
+        long totalSize = getDirectorySize(dataPath);
+        if (totalSize <= maxDiskUsageBytes) {
+            return;
+        }
+        log.warn("Disk usage exceeds limit: {} > {}, start cleaning old versions",
+                FileUtils.byteCountToDisplaySize(totalSize), FileUtils.byteCountToDisplaySize(maxDiskUsageBytes));
+        try (DirectoryStream<Path> paths =  Files.newDirectoryStream(dataPath)) {
+            for (Path path : paths) {
+                if (Files.isDirectory(path)) {
+                    try (FixedVersionRecordLock lock = new FixedVersionRecordLock(path)) {
+                        int latestVersion = lock.latest();
+                        long now = Instant.now().toEpochMilli();
+                        long expireTime = Duration.ofHours(24).toMillis();
+                        for (int v = 1; v < latestVersion; v++) {
+                            long lastOpenTime = lock.recordValue(v);
+                            if (lastOpenTime <= CLEAR_STATE || now - lastOpenTime <= expireTime) {
+                                continue;
+                            }
+                            if (lock.compareAndSetRecordValue(v, lastOpenTime, CLEAR_STATE)) {
+                                Path verPath = path.resolve(String.valueOf(v));
+                                try {
+                                    FileUtils.deleteDirectory(verPath.toFile());
+                                    log.info("Deleted expired version {} in DB {}", v, path.getFileName());
+                                } catch (IOException e) {
+                                    log.error("Failed to delete expired version {} in DB {}", v, path.getFileName(), e);
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        log.error("Failed to clean versions in DB: {}", path.getFileName().toString(), e);
+                    }
+                }
+            }
+        }
+        log.info("Disk usage after cleanup: {}", FileUtils.byteCountToDisplaySize(totalSize));
+    }
+
+    /**
+     * 获取目录大小
+     */
+    private long getDirectorySize(Path path) throws IOException {
+        final AtomicLong size = new AtomicLong(0);
+        try (Stream<Path> walk = Files.walk(path)) {
+            walk.filter(Files::isRegularFile)
+                    .forEach(p -> {
+                        try {
+                            size.addAndGet(Files.size(p));
+                        } catch (IOException ignored) {}
+                    });
+        }
+        return size.get();
+    }
+
 
     /**
      * 启动定时清理任务, 定期清理未被访问的RocksdbWrapper实例
@@ -193,6 +242,7 @@ public class MultiDBManager<K, V> {
         }, initialDelayMinutes, periodMinutes, TimeUnit.MINUTES);
     }
 
+    @Override
     public void close() {
         try {
             rocksdbWrapperLoadingCache.invalidateAll();

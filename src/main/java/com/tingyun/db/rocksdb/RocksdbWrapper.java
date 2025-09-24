@@ -1,5 +1,6 @@
 package com.tingyun.db.rocksdb;
 
+import com.tingyun.db.MultiDBManagerConfig;
 import com.tingyun.db.rocksdb.serde.RocksdbSerde;
 import com.tingyun.db.rocksdb.writer.RocksdbOnceWriter;
 import lombok.extern.slf4j.Slf4j;
@@ -36,26 +37,33 @@ public class RocksdbWrapper<K, V> extends ReadonlyRocksDBWrapper<K, V> {
         RocksDB.loadLibrary();
     }
 
-    public RocksdbWrapper(String dataDir, String dbName, RocksdbSerde<K> kRocksdbSerde, RocksdbSerde<V> vRocksdbSerde) throws IOException {
-        super(dataDir, dbName, kRocksdbSerde, vRocksdbSerde);
-        this.versionClearTime = DEFAULT_VERSION_CLEAR_TIME;
+    public RocksdbWrapper(MultiDBManagerConfig config, String dbName, RocksdbSerde<K> kRocksdbSerde, RocksdbSerde<V> vRocksdbSerde) throws IOException {
+        super(config.getDataDir(), dbName, kRocksdbSerde, vRocksdbSerde);
+        int dbVersionExpire = config.getDbVersionExpire();
+        int versionClearTime = config.getDbVersionCleanTime();
+        if (versionClearTime <= dbVersionExpire) {
+            this.versionClearTime = dbVersionExpire * 5;
+        } else {
+            this.versionClearTime = versionClearTime;
+        }
     }
+
 
     /**
      * 构造函数
      * @param dataDir 数据存储目录
      * @param dbName 数据库名称
-     * @param versionDbCount 版本数据库的数量，超过该数量未被访问的版本数据库将被关闭
-     * @param versionExpireTime 版本数据库的过期时间，单位分钟，超过该时间未被访问的版本数据库将被关闭
-     * @param versionClearTime 版本数据库的清理时间，单位小时，默认24小时
+     * @param dbVersionCount 版本数据库的数量，超过该数量未被访问的版本数据库将被关闭
+     * @param dbVersionExpire 版本数据库的过期时间，单位分钟，超过该时间未被访问的版本数据库将被关闭
+     * @param dbVersionClearTime 版本数据库的清理时间，单位小时，默认24小时
      * @param kRocksdbSerde key的序列化工具
      * @param vRocksdbSerde value的序列化工具
      * @throws IOException 如果IO异常
      */
-    public RocksdbWrapper(String dataDir, String dbName, int versionDbCount,
-                          int versionExpireTime, int versionClearTime, RocksdbSerde<K> kRocksdbSerde, RocksdbSerde<V> vRocksdbSerde) throws IOException {
-        super(dataDir, dbName, versionDbCount, versionExpireTime, kRocksdbSerde, vRocksdbSerde);
-        this.versionClearTime = versionClearTime;
+    public RocksdbWrapper(String dataDir, String dbName, int dbVersionCount,
+                          int dbVersionExpire, int dbVersionClearTime, RocksdbSerde<K> kRocksdbSerde, RocksdbSerde<V> vRocksdbSerde) throws IOException {
+        super(dataDir, dbName, dbVersionCount, dbVersionExpire, kRocksdbSerde, vRocksdbSerde);
+        this.versionClearTime = dbVersionClearTime;
     }
 
     /**
@@ -158,7 +166,7 @@ public class RocksdbWrapper<K, V> extends ReadonlyRocksDBWrapper<K, V> {
         int latest = fixedVersionRecordLock.latest();
         // 当前时间戳
         long now = Instant.now().toEpochMilli();
-        long expireTime = Duration.ofHours(this.versionClearTime).toMillis();
+        long expireTime = Duration.ofMinutes(this.versionClearTime).toMillis();
         // 至少保留一个版本，即清理范围 [1, latest-1] && (now - recordValue(lastOpenTime)) > expireTime
         for (int v = 1; v < latest; v++) {
             // 记录的是最后一次打开的时间戳
