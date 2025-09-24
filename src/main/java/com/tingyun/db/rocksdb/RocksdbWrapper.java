@@ -1,132 +1,73 @@
 package com.tingyun.db.rocksdb;
 
-import com.google.common.base.Preconditions;
-import com.tingyun.db.lock.FixedVersionRecordLock;
+import com.tingyun.db.rocksdb.serde.RocksdbSerde;
+import com.tingyun.db.rocksdb.writer.RocksdbOnceWriter;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.io.FileUtils;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * RocksDB包装类
+ * RocksDB包装类，支持多版本管理，但数据只能写入一次，写入后不可修改
+ * 每次写入数据会创建一个新的版本，旧版本的数据不可修改
  * @param <K> key类型
  * @param <V> value类型
  */
-public class RocksdbWrapper<K, V> {
-
-
-    private static final int READY = 1;
-
-    private static final int NOT_READY = 0;
+@Slf4j
+public class RocksdbWrapper<K, V> extends ReadonlyRocksDBWrapper<K, V> {
 
     /**
-     * dataDir，数据存储目录
+     * 写入数据时，临时版本名称的模版
      */
-    private final String dataDir;
+    private static final String _temp_version_prefix = "_temp_v%d_%d";
     /**
-     * 数据库名称
+     * 清理过期版本的时间，单位小时，默认24小时
      */
-    private final String dbName;
-    /**
-     * 数据库的存储路径
-     */
-    private final Path dbPath;
-    /**
-     * 版本记录工具
-     */
-    private final FixedVersionRecordLock fixedVersionRecordLock;
-
-    private final Serde<K> keySerializer;
-    private final Serde<V> valueSerializer;
-
-    /**
-     * 数据库的状态，0 不可
-     */
-    private final AtomicInteger _dbState = new AtomicInteger(NOT_READY);
-    private RocksDB db;
-    private int dbVersion;
+    private final int versionClearTime; // 小时
 
     static {
         RocksDB.loadLibrary();
     }
 
-    public RocksdbWrapper(String dataDir, String dbName, Serde<K> kSerde, Serde<V> vSerde) throws IOException {
-        Preconditions.checkNotNull(dataDir, "dataDir can not be null");
-        this.dataDir = dataDir;
-        Preconditions.checkNotNull(dbName, "dbName can not be null");
-        this.dbName = dbName;
-        Path path = Path.of(dataDir);
-        if (!Files.exists(path)) {
-            Files.createDirectories(path);
-        }
-        Path dbPath = path.resolve(dbName);
-        if (!Files.exists(dbPath)) {
-            Files.createDirectories(dbPath);
-        }
-        this.dbPath = dbPath;
-        fixedVersionRecordLock = new FixedVersionRecordLock(dbPath);
-        this.keySerializer = kSerde;
-        this.valueSerializer = vSerde;
-    }
-
-    public String name() {
-        return dbName;
-    }
-
-    public int version() {
-        return fixedVersionRecordLock.maxVersion();
+    public RocksdbWrapper(String dataDir, String dbName, RocksdbSerde<K> kRocksdbSerde, RocksdbSerde<V> vRocksdbSerde) throws IOException {
+        super(dataDir, dbName, kRocksdbSerde, vRocksdbSerde);
+        this.versionClearTime = DEFAULT_VERSION_CLEAR_TIME;
     }
 
     /**
-     * 打开最新版本的数据库
-     * @return 是否成功打开
+     * 构造函数
+     * @param dataDir 数据存储目录
+     * @param dbName 数据库名称
+     * @param versionDbCount 版本数据库的数量，超过该数量未被访问的版本数据库将被关闭
+     * @param versionExpireTime 版本数据库的过期时间，单位分钟，超过该时间未被访问的版本数据库将被关闭
+     * @param versionClearTime 版本数据库的清理时间，单位小时，默认24小时
+     * @param kRocksdbSerde key的序列化工具
+     * @param vRocksdbSerde value的序列化工具
+     * @throws IOException 如果IO异常
      */
-    public boolean open() {
-        int maxed = fixedVersionRecordLock.maxVersion();
-        // maxed: 0 标识该数据当前为空
-        if (maxed == 0) {
-            return false;
-        }
-
-        // 当前数据库已打开version 和 maxed 相同
-        if (dbVersion == maxed) {
-            return true;
-        }
-
-        // maxed 对应的版本不存在，无法打开
-        Path verDBPath = dbPath.resolve(String.valueOf(maxed));
-        if (!Files.exists(verDBPath)) {
-            return false;
-        }
-        try {
-            db = RocksDB.open(verDBPath.toString());
-            // 更新版本最后打开时间
-            fixedVersionRecordLock.put(maxed, System.currentTimeMillis());
-            dbVersion = maxed;
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
+    public RocksdbWrapper(String dataDir, String dbName, int versionDbCount,
+                          int versionExpireTime, int versionClearTime, RocksdbSerde<K> kRocksdbSerde, RocksdbSerde<V> vRocksdbSerde) throws IOException {
+        super(dataDir, dbName, versionDbCount, versionExpireTime, kRocksdbSerde, vRocksdbSerde);
+        this.versionClearTime = versionClearTime;
     }
 
-    private static final String _temp_version_prefix = "_temp_v%d_%d";
-
     /**
-     * 数据写入
-     * @param data
-     * @throws IOException
-     * @throws RocksDBException
+     * 写入数据，数据只能写入一次，写入后不可修改
+     * 数据写入时会创建一个新的版本，所以想要数据数据必须一次性写入完成
+     * @param data 数据
      */
-    public void write(Map<K, V> data) throws IOException, RocksDBException {
+    public void writeOnce(Map<K, V> data) throws IOException, RocksDBException {
 
         // 1 数据库的版本号
-        int curV = fixedVersionRecordLock.maxVersion();
-        int nextV = curV + 1;
+        int latest = fixedVersionRecordLock.latest();
+        int nextV = latest + 1;
 
         // 2 为了防止竞争，把数据写入临时版本中，临时版本是随机生成的
         String tempVersionPath = String.format(_temp_version_prefix, nextV, Instant.now().toEpochMilli());
@@ -134,41 +75,110 @@ public class RocksdbWrapper<K, V> {
         if (!Files.exists(tempVerPath)) {
             Files.createDirectories(tempVerPath);
         }
-        RocksDB newRocksDB = RocksDB.open(tempVerPath.toString());
-        for (Map.Entry<K, V> entry : data.entrySet()) {
-            byte[] kBytes = keySerializer.serializer(entry.getKey());
-            byte[] vBytes = valueSerializer.serializer(entry.getValue());
-            newRocksDB.put(kBytes, vBytes);
-        }
 
         // 3 写入完成后必须先关闭
-        newRocksDB.close();
+        try (RocksDB newRocksDB = RocksDB.open(tempVerPath.toString())) {
+            for (Map.Entry<K, V> entry : data.entrySet()) {
+                byte[] kBytes = kRocksdbSerde.serializer(entry.getKey());
+                byte[] vBytes = vRocksdbSerde.serializer(entry.getValue());
+                newRocksDB.put(kBytes, vBytes);
+            }
+        }
 
-        Path nextVersionPath = dbPath.resolve(String.valueOf(nextV));
-        // 4 安全更新数据库版本的原数据，如果更新成功，重新命名，如果失败直接删除
-        if (fixedVersionRecordLock.compareAndSetVersion(curV, nextV)) {
-            Files.move(tempVerPath, dbPath.resolve(nextVersionPath));
+        // 4 写入完成后，尝试更新数据库版本的原数据，如果更新成功，重新命名，如果失败直接删除
+        finalizeVersion(tempVerPath, latest, nextV);
+
+    }
+
+    /**
+     * 写入数据，数据只能写入一次，写入后不可修改
+     * @param rocksdbOnceWriter 写入数据的代理, 该代理负责将数据写入RocksDB实例, 返回true表示写入成功, false表示写入失败
+     * @throws IOException IO异常
+     * @throws RocksDBException RocksDB异常
+     */
+    public void writeOnceWithWriter(RocksdbOnceWriter<K, V> rocksdbOnceWriter) throws IOException, RocksDBException {
+
+        // 1 数据库的版本号
+        int latest = fixedVersionRecordLock.latest();
+        int nextV = latest + 1;
+
+        // 2 为了防止竞争，把数据写入临时版本中，临时版本是随机生成的
+        Path tempVerPath = prepareTempVersionPath(nextV);
+
+        // 3 写入数据, 失败则删除临时目录
+        boolean writeSuccess;
+        try (RocksDB newRocksDB = RocksDB.open(tempVerPath.toString())) {
+            writeSuccess = rocksdbOnceWriter.write(newRocksDB, kRocksdbSerde, vRocksdbSerde);
+        }
+
+        // 4 成功写入后，尝试更新数据库版本的原数据，如果更新成功，重新命名，如果失败直接删除
+        if (writeSuccess) {
+            finalizeVersion(tempVerPath, latest, nextV);
         } else {
-            Files.deleteIfExists(tempVerPath);
+            FileUtils.deleteDirectory(tempVerPath.toFile());
+            log.trace("Writer aborted, temp version deleted: {}", tempVerPath);
         }
 
     }
 
-    public V search(K key) throws RocksDBException {
-        if (_dbState.get() != 1) {
-            throw new RocksDBException("RocksDB open failed");
+
+    /**
+     * 准备临时版本目录
+     * @param nextV 下一个版本号
+     * @return 临时版本目录路径
+     */
+    private Path prepareTempVersionPath(int nextV) throws IOException {
+        String tempVersionName = String.format(_temp_version_prefix, nextV, Instant.now().toEpochMilli());
+        Path tempVerPath = dbPath.resolve(tempVersionName);
+        Files.createDirectories(tempVerPath);
+        return tempVerPath;
+    }
+
+    /**
+     * 写入完成后，尝试更新元信息并重命名版本目录
+     * @param tempVerPath 临时版本目录
+     * @param latest 当前最新版本号
+     * @param nextV 下一个版本号
+     */
+    private void finalizeVersion(Path tempVerPath, int latest, int nextV) throws IOException {
+        Path nextVersionPath = dbPath.resolve(String.valueOf(nextV));
+        if (fixedVersionRecordLock.compareAndSetMeta(latest, nextV)) {
+            Files.move(tempVerPath, nextVersionPath);
+            log.info("Promoted RocksDB version {} -> {}", latest, nextV);
+        } else {
+            FileUtils.deleteDirectory(tempVerPath.toFile());
+            log.warn("CAS failed, discard temp version: {}", tempVerPath);
         }
-        byte[] kBytes = keySerializer.serializer(key);
-        byte[] v = db.get(kBytes);
-        return valueSerializer.deserializer(v);
     }
 
-    public void finishWrite() {
-
-    }
-
-    public void close() {
-
+    /**
+     * 清理过期版本，至少保留一个版本
+     */
+    public void clear() {
+        int latest = fixedVersionRecordLock.latest();
+        // 当前时间戳
+        long now = Instant.now().toEpochMilli();
+        long expireTime = Duration.ofHours(this.versionClearTime).toMillis();
+        // 至少保留一个版本，即清理范围 [1, latest-1] && (now - recordValue(lastOpenTime)) > expireTime
+        for (int v = 1; v < latest; v++) {
+            // 记录的是最后一次打开的时间戳
+            long lastOpenTime = fixedVersionRecordLock.recordValue(v);
+            if (lastOpenTime < 0 || now - lastOpenTime <= expireTime) {
+                // 已经被清理，或者未过期
+                continue;
+            }
+            if (fixedVersionRecordLock.compareAndSetRecordValue(v, lastOpenTime, CLEAR_STATE)) {
+                try {
+                    Path verPath = dbPath.resolve(String.valueOf(v));
+                    FileUtils.deleteDirectory(verPath.toFile());
+                    log.info("Successfully cleared expired version {}/{}", dbName, v);
+                } catch (Exception e) {
+                    log.error("Failed to clear expired version {}/{}", dbName, v, e);
+                    // 清理失败，恢复状态
+                    fixedVersionRecordLock.compareAndSetRecordValue(v, CLEAR_STATE, lastOpenTime);
+                }
+            }
+        }
     }
 
 }

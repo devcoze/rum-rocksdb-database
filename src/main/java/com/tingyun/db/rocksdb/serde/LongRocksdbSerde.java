@@ -1,14 +1,21 @@
-package com.tingyun.db.rocksdb;
+package com.tingyun.db.rocksdb.serde;
 
 import java.nio.ByteOrder;
 
-public class LongSerde implements Serde<Long> {
+/**
+ * Long 序列化器
+ * @author chenlt
+ */
+public class LongRocksdbSerde implements RocksdbSerde<Long> {
 
+    public static final LongRocksdbSerde INSTANCE = new LongRocksdbSerde();
+
+    /**
+     * 字节序
+     */
     private static final ByteOrder byteOrder;
-
-    public static final LongSerde INSTANCE = new LongSerde();
-
     static {
+        // 获取本地字节序
         byteOrder = ByteOrder.nativeOrder();
     }
 
